@@ -1,4 +1,6 @@
 #![feature(termination_trait)]
+use std::ptr::read;
+
 use esp_idf_sys as _; // If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
 use log::*;
 use esp_idf_sys::EspError;
@@ -98,6 +100,87 @@ impl Dac<'_>{
 }
 */
 
+const ADC_FSR:f32=4.096; //PGA 001 FSR=4.096
+
+fn get_temperature_adc(adc:u16)->f32{
+    let v_adc=adc as f32/2048.0*ADC_FSR;
+    let r=1000.0;
+    let vcc=3.3;
+    let r_ntc=(r*vcc-v_adc*r)/v_adc;
+    const B:f32=3984.0;
+    const R25:f32=10000.0;
+    const T25:f32=25.0+273.15;
+    let r_r0=r_ntc/R25;
+    1.0/(1.0/B*r_r0.log(std::f32::consts::E)+1.0/T25) - 273.15
+}
+
+fn get_current_adc(adc:u16)->f32{
+    let v_adc=adc as f32/2048.0*ADC_FSR;
+    v_adc/100.0/0.001
+}
+
+fn get_voltage_adc(adc:u16)->f32{
+    let v_adc=adc as f32/2048.0*ADC_FSR;
+    v_adc*(47.0+3.9)/3.3
+}
+////////////////////
+
+fn get_temperature(i2c:&mut I2cDriver)->f32{
+    let adc=read_adc(i2c, 1) as f32;
+    let v_adc=adc/2048.0*ADC_FSR;
+
+    let r_ntc=1000.0/v_adc-1000.0;
+
+    const B:f32=3984.0;
+    const R25:f32=10000.0;
+    const T25:f32=25.0+273.15;
+    let r_r0=r_ntc/R25;
+    
+    1.0/(1.0/B*r_r0.log(std::f32::consts::E)+1.0/T25) - 273.15
+
+}
+
+fn get_current(i2c:&mut I2cDriver)->f32{
+    let adc=read_adc(i2c, 2) as f32;
+    let v_adc=adc/2048.0*ADC_FSR;
+
+    v_adc/100.0/0.001
+
+}
+
+fn get_voltage(i2c:&mut I2cDriver)->f32{
+    let adc=read_adc(i2c, 3) as f32;
+    let v_adc=adc/2048.0*ADC_FSR;
+
+    v_adc*(47.0+3.9)/3.3
+
+}
+
+fn read_adc(i2c: &mut I2cDriver,ch: u16)->u16{
+    const TLA202X_ADDR:u8=0b1001_000;
+    const TLA202X_OS:u16=1;
+    let TLA202X_MUX:u16=ch|0b100;
+    const TLA202X_PGA:u16=0b001;
+    const TLA202X_MODE:u16=1;
+    const TLA202X_DR:u16=0b100;
+    let data=TLA202X_OS<<15 | TLA202X_MUX<<12 | TLA202X_PGA<<9 | TLA202X_MODE<<8 | TLA202X_DR<<5;
+    let data3byte =[0b01u8 ,((data>>8)&0xff) as u8 , ((data)&0xff) as u8];
+    i2c.write(TLA202X_ADDR|0b0000_0000u8,&data3byte,      BLOCK);
+    //i2c.write(TLA202X_ADDR|0b0000_0000u8,&[0b0000_0000u8],BLOCK);
+    let mut buf=[0u8,0u8];
+
+    i2c.write_read(TLA202X_ADDR|0b1000_0000u8, &[0b1u8],& mut buf, BLOCK);
+    //info!("read:{},{}",buf[0],buf[1]);
+
+    i2c.write_read(TLA202X_ADDR|0b1000_0000u8, &[0b0u8],& mut buf, BLOCK);
+
+//    i2c.read(TLA202X_ADDR|0b1000_0000u8,&mut buf, BLOCK);
+    //info!("ADC:{},{},{}",(buf[0] as u16)<<4| (buf[0] as u16)>>4, buf[0],buf[1]);
+    (((buf[0] as u16)<<8| (buf[1] as u16)))>>4 as u16
+
+    
+}
+
 fn set_current(i2c:&mut I2cDriver, current_ref:f64){
     let r_shunt=0.001;
     let amp=100.0;
@@ -137,6 +220,16 @@ fn main()-> Result<(), EspError>{
     let btn_a = PinDriver::input(pin_a).unwrap();
     let btn_b = PinDriver::input(pin_b).unwrap();
     let btn_c = PinDriver::input(pin_c).unwrap();
+
+
+    let mut rotary_sw = PinDriver::input(peripherals.pins.gpio13).unwrap();
+    let mut RotaryENCA = PinDriver::input(peripherals.pins.gpio34).unwrap();
+    let mut RotaryENCB = PinDriver::input(peripherals.pins.gpio0).unwrap();
+
+    let led_r = PinDriver::output(peripherals.pins.gpio12).unwrap();
+    let led_g = PinDriver::output(peripherals.pins.gpio5).unwrap();
+    let led_b = PinDriver::output(peripherals.pins.gpio2).unwrap();
+
 //////////////////////////////////
 
     let periph_i2c = peripherals.i2c0;
@@ -150,228 +243,67 @@ fn main()-> Result<(), EspError>{
     let mut driver = LedcDriver::new(peripherals.ledc.channel0,timer_driver, peripherals.pins.gpio15)?;
 
     let max_duty = driver.get_max_duty();
-    let mut fun_duty=0.1;
-    driver.set_duty( (max_duty as f32 * fun_duty) as u32);
-
+    let mut fun_duty=0.15;
+    driver.set_duty( (max_duty as f32 * fun_duty) as u32)?;
 
     let mut i_ref=0.0;
+    set_current(&mut i2c,i_ref);
+
+    let mut pre_a = btn_a.is_low();
+    let mut pre_b = btn_b.is_low();
+    let mut pre_c = btn_c.is_low();
+    let mut pre_rotary_sw = rotary_sw.is_high();
+
+
     loop{
-        info!("Iref:{}  A:{} B:{} C:{}",i_ref, btn_a.is_high(), btn_b.is_high(), btn_c.is_high());
-        if btn_a.is_high()==false {
+        let adc3=read_adc(&mut i2c, 3);
+        let adc2=read_adc(&mut i2c, 2);
+        let adc1=read_adc(&mut i2c, 1);
+        let adc0=read_adc(&mut i2c, 0);
+
+        let current=get_current_adc(adc1);
+        let voltage=get_voltage_adc(adc2);
+        let temp=get_temperature_adc(adc0);
+        // let current=get_current(&mut i2c);
+        // let voltage=get_voltage(&mut i2c);
+        // let temp=get_temperature(&mut i2c);
+        info!("Vin:{:5.2} [V] Iref:{:5.2},I:{:5.2}, Temp:{:5.1} [degC] adc:{}",voltage,i_ref,current,temp,adc0);
+        
+        //info!("Iref:{:3.1}  ch0:{:4} ch1:{:4} ch2:{:4} ch3:{:4}",i_ref, adc0,adc1,adc2,adc3);
+        
+        if pre_a ==false && btn_a.is_low()==true {
             i_ref=i_ref+0.5;
-            set_current(&mut i2c,i_ref);
-            if i_ref >=2.0{
-                i_ref=2.0
+            if i_ref >=5.0{
+                i_ref=5.0
             }                
         }
 
-        if btn_b.is_high()==false{
+        if pre_b ==false && btn_b.is_low()==true {
+            fun_duty=0.15-fun_duty;
+            driver.set_duty( (max_duty as f32 * fun_duty) as u32);
+        }
+
+
+        if pre_c ==false && btn_c.is_low()==true {
             i_ref=i_ref-0.5;
-            set_current(&mut i2c,i_ref);
             if i_ref <0.0{
                 i_ref=0.0
             }    
         }
 
-        FreeRtos::delay_ms(1000);
+        if pre_rotary_sw==false && rotary_sw.is_high(){
+            set_current(&mut i2c,i_ref);
+        }
+
+
+        pre_a = btn_a.is_low();
+        pre_b = btn_b.is_low();
+        pre_c = btn_c.is_low();
+        pre_rotary_sw = rotary_sw.is_high();
+
+        FreeRtos::delay_ms(10);
     }
 
     Ok(())
 
 }
-
-
-//*/
-/*
-#![feature(termination_trait)]
-use esp_idf_sys as _; // If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
-use log::*;
-
-use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::delay::BLOCK;
-use esp_idf_hal::gpio::Level;
-use esp_idf_hal::gpio::PinDriver;
-use esp_idf_hal::gpio::Pull;
-use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_hal::prelude::*;
-use esp_idf_hal::ledc::*;
-
-use esp_idf_hal::i2c::*;
-
-use esp_idf_sys::EspError;
-
-fn read_ADC(i2c: &mut I2cDriver,ch: u16)->u32{
-    const TLA202x_ADDR:u8=0b1001_000;
-    const TLA202x_OS:u16=1;
-    let TLA202x_MUX:u16=ch+0b100;
-    const TLA202x_PGA:u16=0b001;
-    const TLA202x_MODE:u16=1;
-    const TLA202x_DR:u16=0b100;
-    let data=TLA202x_OS<<15 | TLA202x_MUX<<12 | TLA202x_PGA<<9 | TLA202x_MODE<<8 | TLA202x_DR<<5;
-    let data2byte =[0b01u8 ,((data>>8)&0xff) as u8 , ((data)&0xff) as u8];
-    i2c.write(TLA202x_ADDR|0b0000_0000u8,&data2byte,BLOCK);
-    let mut buf=[0u8,0u8];
-    i2c.write(TLA202x_ADDR|0b0000_0000u8,&[0b0000_0000u8],BLOCK);
-   // i2c.write_read(TLA202x_ADDR|0b1000_0000u8, &[0b1u8],& mut buf, BLOCK);
-    i2c.read(TLA202x_ADDR|0b1000_0000u8,&mut buf, BLOCK);
-    //info!("ADC:{},{},{}",(buf[0] as u16)<<4| (buf[0] as u16)>>4, buf[0],buf[1]);
-    ((buf[0] as u16)<<4| (buf[0] as u16)>>4) as u32
-
-    
-}
-fn main() -> Result<(), EspError>{
-    // It is necessary to call this function once. Otherwise some patches to the runtime
-    // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
-    esp_idf_sys::link_patches();
-    // Bind the log crate to the ESP Logging facilities
-    esp_idf_svc::log::EspLogger::initialize_default();
-
-    let peripherals = Peripherals::take().unwrap();
-
-    let mut BtnA = PinDriver::input(peripherals.pins.gpio39).unwrap();
-    let mut BtnB = PinDriver::input(peripherals.pins.gpio38).unwrap();
-    let mut BtnC = PinDriver::input(peripherals.pins.gpio37).unwrap();
-
-    let mut RotarySW = PinDriver::input(peripherals.pins.gpio13).unwrap();
-    let mut RotaryENCA = PinDriver::input(peripherals.pins.gpio34).unwrap();
-    let mut RotaryENCB = PinDriver::input(peripherals.pins.gpio0).unwrap();
-
-    let mut ledR = PinDriver::output(peripherals.pins.gpio12).unwrap();
-    let mut ledG = PinDriver::output(peripherals.pins.gpio5).unwrap();
-    let mut ledB = PinDriver::output(peripherals.pins.gpio2).unwrap();
-
-//    let mut fan = PinDriver::output(peripherals.pins.gpio15).unwrap();
-//    fan.set_low();
-
-    let timer_driver = LedcTimerDriver::new(peripherals.ledc.timer0, &esp_idf_hal::ledc::config::TimerConfig::default().frequency(25.kHz().into()))?;
-    let mut driver = LedcDriver::new(peripherals.ledc.channel0,timer_driver, peripherals.pins.gpio15)?;
-
-    let max_duty = driver.get_max_duty();
-    driver.set_duty(0);
-    let mut fun_duty=0.0;
-
-    let mut preA=RotaryENCA.is_high();
-    let mut preB=RotaryENCB.is_high();
-
-
-    let i2c = peripherals.i2c0;
-    let sda = peripherals.pins.gpio21;
-    let scl = peripherals.pins.gpio22;
-
-    const MCP4726A0T_ADDR: u8 = 0x60;
-    let config = I2cConfig::new().baudrate(100.kHz().into());
-    let mut i2c = I2cDriver::new(i2c, sda, scl, &config).unwrap();
-
-    let mut n=1;
-    let mut v=0i16;
-    let command_bit = 0b01100000;
-    let Vref_bit    = 0b00010000;
-    let PD_bit      = 0b00000110;
-    while true {
-        let mut data=0b01000000;
-        
-      //  info!("Set {} fun {} ADC {}, {}, {}", v, fun_duty,read_ADC(&mut i2c,0),read_ADC(&mut i2c,1),read_ADC(&mut i2c,2));
-        n+=1;
-        //v+=1023;
-/*
-        if preA{
-            if RotaryENCA.is_low(){
-                if RotaryENCB.is_high(){
-                    fun_duty=fun_duty-0.05;
-                } else {
-                    fun_duty=fun_duty+0.05;
-                }
-            }
-        }else{
-            if RotaryENCA.is_high(){
-                if RotaryENCB.is_high(){
-                    fun_duty=fun_duty+0.05;
-                } else {
-                    fun_duty=fun_duty-0.05;
-                }
-            }
-        }
-        if preB{
-            if RotaryENCB.is_low(){
-                if RotaryENCA.is_high(){
-                    fun_duty=fun_duty-0.05;
-                } else {
-                    fun_duty=fun_duty+0.05;
-                }
-            }
-        }else{
-            if RotaryENCB.is_high(){
-                if RotaryENCA.is_high(){
-                    fun_duty=fun_duty+0.05;
-                } else {
-                    fun_duty=fun_duty-0.05;
-                }
-            }
-        }
-
-        if fun_duty>1.0{
-            fun_duty=1.0;
-        }
-        if fun_duty<0.0{
-            fun_duty=0.0;
-        }
-        preA=RotaryENCA.is_high();
-        preB=RotaryENCB.is_high();
-    
-        fun_duty=0.15;
-        driver.set_duty( (max_duty as f32 * fun_duty) as u32);
-
-        if RotarySW.is_high(){
-            driver.set_duty( (max_duty as f32 * fun_duty) as u32);
-        } else {
-  //          driver.set_duty(0);
-//            fan.set_low();
-        }
-        */
-        if BtnA.is_high() {
-        //    ledR.set_high();
-        } else {
-            v+=1;
-        //    ledR.set_low();
-        }
-
-        if BtnB.is_high() {
-        //    ledG.set_high();
-        } else {
-            v-=1;
-
-        //    ledG.set_low();
-        }
-
-        if BtnC.is_high() {
-        //    ledB.set_high();
-        } else {
-            ledB.set_high();
-        //    i2c.write(MCP4726A0T_ADDR, &[0x00,command_bit | Vref_bit | PD_bit, (v>>8 &0xff).try_into().unwrap(), (v&0xff).try_into().unwrap()],BLOCK);
-        }
-        if v > 4096{
-            v=4095;
-        }
-        if v<0{
-            v=0;
-        }
-        FreeRtos::delay_ms(10);
-        // LEDG.set_high()?;
-        // FreeRtos::delay_ms(500);
-        // LEDB.set_high()?;
-        // FreeRtos::delay_ms(500);
-
-        // LEDR.set_low();
-        // FreeRtos::delay_ms(500);
-        // LEDG.set_low()?;
-        // FreeRtos::delay_ms(500);
-        // LEDB.set_low()?;
-        // FreeRtos::delay_ms(500);
-
-    }
-
-    Ok(())  
-
-    
-}
-*/
